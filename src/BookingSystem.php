@@ -1,79 +1,189 @@
 <?php declare(strict_types=1);
+
 namespace Gratis\Booking;
 
-final class BookingSystem
-{
-    public static function register(): void
-    {
-        register_post_type('gratis_service', [
-            'labels' => ['name' => 'Services'], 'public' => true, 'show_in_rest' => true,
-            'menu_icon' => 'dashicons-calendar-alt', 'supports' => ['title', 'editor', 'thumbnail', 'custom-fields'],
+defined('ABSPATH') || exit;
+
+/**
+ * Core booking engine: registers the service/appointment post types, the REST
+ * slot/booking endpoints and the front-end booking shortcode.
+ */
+final class BookingSystem {
+
+    public const SERVICE_TYPE     = 'gratis_service';
+    public const APPOINTMENT_TYPE = 'gratis_appointment';
+
+    /** Register post types, meta and the shortcode. */
+    public static function register(): void {
+        register_post_type(self::SERVICE_TYPE, [
+            'labels'      => [
+                'name'          => __('Services', 'gratis-booking'),
+                'singular_name' => __('Service', 'gratis-booking'),
+            ],
+            'public'      => true,
+            'show_in_rest' => true,
+            'menu_icon'   => 'dashicons-calendar-alt',
+            'supports'    => ['title', 'editor', 'thumbnail', 'custom-fields'],
         ]);
-        register_post_type('gratis_appointment', [
-            'labels' => ['name' => 'Appointments'], 'public' => false, 'show_ui' => true,
-            'show_in_menu' => 'edit.php?post_type=gratis_service',
+
+        register_post_type(self::APPOINTMENT_TYPE, [
+            'labels'       => [
+                'name'          => __('Appointments', 'gratis-booking'),
+                'singular_name' => __('Appointment', 'gratis-booking'),
+            ],
+            'public'       => false,
+            'show_ui'      => true,
+            'show_in_menu' => 'edit.php?post_type=' . self::SERVICE_TYPE,
+            'supports'     => ['title'],
         ]);
-        register_post_meta('gratis_service', '_duration', ['type' => 'integer', 'single' => true, 'show_in_rest' => true]);
-        register_post_meta('gratis_service', '_price', ['type' => 'number', 'single' => true, 'show_in_rest' => true]);
-        register_post_meta('gratis_service', '_availability', ['type' => 'string', 'single' => true, 'show_in_rest' => true]);
+
+        register_post_meta(self::SERVICE_TYPE, '_duration', ['type' => 'integer', 'single' => true, 'show_in_rest' => true, 'auth_callback' => [__CLASS__, 'canEdit']]);
+        register_post_meta(self::SERVICE_TYPE, '_price', ['type' => 'number', 'single' => true, 'show_in_rest' => true, 'auth_callback' => [__CLASS__, 'canEdit']]);
 
         add_shortcode('gratis-booking', [__CLASS__, 'shortcode']);
+        add_shortcode('gratis_booking', [__CLASS__, 'shortcode']);
     }
 
-    public static function registerAPI(): void
-    {
+    /** Meta auth callback. */
+    public static function canEdit(): bool {
+        return current_user_can('edit_posts');
+    }
+
+    /** Register the REST slot + booking routes. */
+    public static function registerAPI(): void {
         register_rest_route('gratis-booking/v1', '/slots/(?P<service_id>\d+)', [
-            'methods' => 'GET', 'permission_callback' => '__return_true',
-            'callback' => function ($req) {
-                $service_id = (int) $req['service_id'];
-                $date = $req->get_param('date') ?: date('Y-m-d');
-                $duration = (int) get_post_meta($service_id, '_duration', true) ?: 60;
-                $slots = self::getAvailableSlots($service_id, $date, $duration);
-                return new \WP_REST_Response($slots);
-            },
+            'methods'             => 'GET',
+            'permission_callback' => '__return_true',
+            'callback'            => [__CLASS__, 'restSlots'],
         ]);
 
         register_rest_route('gratis-booking/v1', '/book', [
-            'methods' => 'POST', 'permission_callback' => '__return_true',
-            'callback' => function ($req) {
-                $data = $req->get_json_params();
-                $id = wp_insert_post([
-                    'post_type' => 'gratis_appointment', 'post_status' => 'publish',
-                    'post_title' => ($data['name'] ?? 'Guest') . ' - ' . ($data['date'] ?? ''),
-                    'meta_input' => [
-                        '_service_id' => (int) ($data['service_id'] ?? 0),
-                        '_date' => sanitize_text_field($data['date'] ?? ''),
-                        '_time' => sanitize_text_field($data['time'] ?? ''),
-                        '_name' => sanitize_text_field($data['name'] ?? ''),
-                        '_email' => sanitize_email($data['email'] ?? ''),
-                        '_status' => 'confirmed',
-                    ],
-                ]);
-                wp_mail($data['email'] ?? '', 'Booking Confirmed', "Your appointment on {$data['date']} at {$data['time']} is confirmed.");
-                return new \WP_REST_Response(['success' => true, 'id' => $id]);
-            },
+            'methods'             => 'POST',
+            'permission_callback' => '__return_true',
+            'callback'            => [__CLASS__, 'restBook'],
         ]);
     }
 
-    public static function shortcode($atts): string
-    {
-        $atts = shortcode_atts(['service' => 0], $atts);
-        return '<div class="gratis-booking-widget" data-service="' . (int) $atts['service'] . '"><p>Loading booking calendar...</p></div>';
+    /** GET available slots for a service on a date. */
+    public static function restSlots(\WP_REST_Request $req): \WP_REST_Response {
+        $service_id = (int) $req['service_id'];
+        $date       = sanitize_text_field((string) ($req->get_param('date') ?: gmdate('Y-m-d')));
+        $duration   = (int) get_post_meta($service_id, '_duration', true) ?: Settings::slotInterval();
+        $slots      = self::getAvailableSlots($service_id, $date, $duration);
+
+        return new \WP_REST_Response($slots);
     }
 
-    private static function getAvailableSlots(int $serviceId, string $date, int $duration): array
-    {
-        $booked = get_posts(['post_type' => 'gratis_appointment', 'numberposts' => -1,
-            'meta_query' => [['key' => '_service_id', 'value' => $serviceId], ['key' => '_date', 'value' => $date]]]);
-        $bookedTimes = array_map(fn($b) => get_post_meta($b->ID, '_time', true), $booked);
+    /** POST a new booking. */
+    public static function restBook(\WP_REST_Request $req): \WP_REST_Response {
+        $data = (array) $req->get_json_params();
+
+        $name  = sanitize_text_field((string) ($data['name'] ?? 'Guest'));
+        $email = sanitize_email((string) ($data['email'] ?? ''));
+        $date  = sanitize_text_field((string) ($data['date'] ?? ''));
+        $time  = sanitize_text_field((string) ($data['time'] ?? ''));
+
+        if ('' === $email || !is_email($email)) {
+            return new \WP_REST_Response(['error' => __('A valid email is required.', 'gratis-booking')], 400);
+        }
+
+        $id = wp_insert_post([
+            'post_type'   => self::APPOINTMENT_TYPE,
+            'post_status' => 'publish',
+            'post_title'  => $name . ' - ' . $date . ' ' . $time,
+            'meta_input'  => [
+                '_service_id' => (int) ($data['service_id'] ?? 0),
+                '_date'       => $date,
+                '_time'       => $time,
+                '_name'       => $name,
+                '_email'      => $email,
+                '_status'     => 'confirmed',
+            ],
+        ]);
+
+        if (is_wp_error($id)) {
+            return new \WP_REST_Response(['error' => $id->get_error_message()], 500);
+        }
+
+        self::notify($email, $name, $date, $time);
+        do_action('gratis_booking_created', $id, $data);
+
+        return new \WP_REST_Response(['success' => true, 'id' => $id]);
+    }
+
+    /** Send confirmation emails to the customer and the site admin. */
+    private static function notify(string $email, string $name, string $date, string $time): void {
+        $subject = __('Booking Confirmed', 'gratis-booking');
+        $body    = sprintf(
+            /* translators: 1: date, 2: time. */
+            __('Your appointment on %1$s at %2$s is confirmed.', 'gratis-booking'),
+            $date,
+            $time
+        );
+        wp_mail($email, $subject, $body);
+
+        $admin = Settings::notificationEmail();
+        if ('' !== $admin) {
+            wp_mail(
+                $admin,
+                __('New booking received', 'gratis-booking'),
+                sprintf(
+                    /* translators: 1: customer name, 2: date, 3: time. */
+                    __('%1$s booked an appointment on %2$s at %3$s.', 'gratis-booking'),
+                    $name,
+                    $date,
+                    $time
+                )
+            );
+        }
+    }
+
+    /** Front-end booking widget shortcode. */
+    public static function shortcode($atts): string {
+        $atts = shortcode_atts(['service' => 0], $atts, 'gratis-booking');
+
+        return '<div class="gratis-booking-widget" data-service="' . absint($atts['service']) . '">'
+            . '<p>' . esc_html__('Loading booking calendar…', 'gratis-booking') . '</p></div>';
+    }
+
+    /**
+     * Compute open time slots for a service on a date, honouring business hours
+     * configured in settings and already-booked appointments.
+     *
+     * @return string[]
+     */
+    private static function getAvailableSlots(int $serviceId, string $date, int $duration): array {
+        $duration = $duration > 0 ? $duration : 60;
+
+        // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query -- bounded admin/booking lookup.
+        $booked = get_posts([
+            'post_type'      => self::APPOINTMENT_TYPE,
+            // phpcs:ignore WordPress.WP.PostsPerPage.posts_per_page_posts_per_page -- bounded booking lookup.
+            'posts_per_page' => 200,
+            'meta_query'     => [
+                'relation' => 'AND',
+                ['key' => '_service_id', 'value' => $serviceId],
+                ['key' => '_date', 'value' => $date],
+            ],
+        ]);
+
+        $bookedTimes = array_map(
+            static fn($b) => (string) get_post_meta($b->ID, '_time', true),
+            $booked
+        );
+
+        [$startHour, $endHour] = Settings::businessHours();
 
         $slots = [];
-        for ($h = 9; $h < 17; $h++) {
+        for ($h = $startHour; $h < $endHour; $h++) {
             for ($m = 0; $m < 60; $m += $duration) {
                 $time = sprintf('%02d:%02d', $h, $m);
-                if (!in_array($time, $bookedTimes)) $slots[] = $time;
+                if (!in_array($time, $bookedTimes, true)) {
+                    $slots[] = $time;
+                }
             }
         }
+
         return $slots;
     }
 }
