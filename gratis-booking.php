@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Gratis Booking
  * Plugin URI: https://github.com/juslintek/gratis-booking
- * Description: Appointment scheduling + calendar. Replaces Amelia ($59/yr), Bookly ($89).
+ * Description: Appointment scheduling + calendar.
  * Version: 1.0.0
  * Requires at least: 6.4
  * Requires PHP: 8.1
