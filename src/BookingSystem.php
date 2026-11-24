@@ -140,10 +140,74 @@ final class BookingSystem {
 
     /** Front-end booking widget shortcode. */
     public static function shortcode($atts): string {
-        $atts = shortcode_atts(['service' => 0], $atts, 'gratis-booking');
+        $atts       = shortcode_atts(['service' => 0], $atts, 'gratis-booking');
+        $service_id = absint($atts['service']);
 
-        return '<div class="gratis-booking-widget" data-service="' . absint($atts['service']) . '">'
-            . '<p>' . esc_html__('Loading booking calendar…', 'gratis-booking') . '</p></div>';
+        // phpcs:ignore WordPress.WP.PostsPerPage.posts_per_page_posts_per_page -- bounded service list for selector.
+        $services = get_posts([
+            'post_type'      => self::SERVICE_TYPE,
+            'post_status'    => 'publish',
+            'posts_per_page' => 50,
+            'orderby'        => 'title',
+            'order'          => 'ASC',
+        ]);
+
+        if (empty($services)) {
+            return '<div class="gratis-booking-widget"><p>' . esc_html__('No services are available for booking yet.', 'gratis-booking') . '</p></div>';
+        }
+
+        wp_enqueue_script(
+            'gratis-booking-widget',
+            GRATIS_BOOKING_URL . 'assets/booking.js',
+            [],
+            GRATIS_BOOKING_VERSION,
+            true
+        );
+
+        $default_date = gmdate('Y-m-d', strtotime('+1 day'));
+        $rest_url     = rest_url('gratis-booking/v1');
+        $uid          = wp_unique_id('gb-');
+
+        $options = '';
+        foreach ($services as $idx => $svc) {
+            $dur   = (int) get_post_meta($svc->ID, '_duration', true) ?: Settings::slotInterval();
+            $price = get_post_meta($svc->ID, '_price', true);
+            $label = $svc->post_title . ' (' . $dur . ' min' . ('' !== (string) $price ? ' · $' . $price : '') . ')';
+            $sel   = ($service_id > 0 ? $svc->ID === $service_id : 0 === $idx) ? ' selected' : '';
+            $options .= '<option value="' . absint($svc->ID) . '"' . $sel . '>' . esc_html($label) . '</option>';
+        }
+
+        return '<div class="gratis-booking-widget" data-service="' . absint($service_id) . '" data-rest-url="' . esc_url($rest_url) . '">'
+            . '<form class="gratis-booking-form">'
+            . '<div class="gratis-booking-row">'
+            . '<div class="gratis-booking-field">'
+            . '<label for="' . esc_attr($uid . '-svc') . '">' . esc_html__('Service', 'gratis-booking') . '</label>'
+            . '<select id="' . esc_attr($uid . '-svc') . '" class="gratis-booking-service" name="service_id">' . $options . '</select>'
+            . '</div>'
+            . '<div class="gratis-booking-field">'
+            . '<label for="' . esc_attr($uid . '-date') . '">' . esc_html__('Date', 'gratis-booking') . '</label>'
+            . '<input type="date" id="' . esc_attr($uid . '-date') . '" class="gratis-booking-date" name="date" min="' . esc_attr(gmdate('Y-m-d')) . '" value="' . esc_attr($default_date) . '" required>'
+            . '</div>'
+            . '</div>'
+            . '<div class="gratis-booking-field">'
+            . '<span class="gratis-booking-label">' . esc_html__('Available Time Slots', 'gratis-booking') . '</span>'
+            . '<div class="gratis-booking-slots" role="group" aria-label="' . esc_attr__('Available Time Slots', 'gratis-booking') . '"></div>'
+            . '<input type="hidden" class="gratis-booking-time" name="time" value="">'
+            . '</div>'
+            . '<div class="gratis-booking-row">'
+            . '<div class="gratis-booking-field">'
+            . '<label for="' . esc_attr($uid . '-name') . '">' . esc_html__('Your Name', 'gratis-booking') . '</label>'
+            . '<input type="text" id="' . esc_attr($uid . '-name') . '" name="name" placeholder="' . esc_attr__('Jane Doe', 'gratis-booking') . '" required>'
+            . '</div>'
+            . '<div class="gratis-booking-field">'
+            . '<label for="' . esc_attr($uid . '-email') . '">' . esc_html__('Email Address', 'gratis-booking') . '</label>'
+            . '<input type="email" id="' . esc_attr($uid . '-email') . '" name="email" placeholder="' . esc_attr__('jane@example.com', 'gratis-booking') . '" required>'
+            . '</div>'
+            . '</div>'
+            . '<button type="submit" class="gratis-booking-submit">' . esc_html__('Confirm Appointment', 'gratis-booking') . '</button>'
+            . '<p class="gratis-booking-status" aria-live="polite"></p>'
+            . '</form>'
+            . '</div>';
     }
 
     /**
