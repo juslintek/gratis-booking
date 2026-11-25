@@ -76,26 +76,62 @@ final class BookingSystem {
 
     /** POST a new booking. */
     public static function restBook(\WP_REST_Request $req): \WP_REST_Response {
+        $rate_key = 'gratis_booking_rl_' . self::visitorHash();
+        $attempts = (int) get_transient($rate_key);
+        if ($attempts >= 5) {
+            return new \WP_REST_Response(['error' => __('Too many booking requests. Please try again later.', 'gratis-booking')], 429);
+        }
+
         $data = (array) $req->get_json_params();
 
-        $name  = sanitize_text_field((string) ($data['name'] ?? 'Guest'));
-        $email = sanitize_email((string) ($data['email'] ?? ''));
-        $date  = sanitize_text_field((string) ($data['date'] ?? ''));
-        $time  = sanitize_text_field((string) ($data['time'] ?? ''));
+        $service_id = absint($data['service_id'] ?? 0);
+        $name       = trim(sanitize_text_field((string) ($data['name'] ?? 'Guest')));
+        $email      = sanitize_email((string) ($data['email'] ?? ''));
+        $date       = sanitize_text_field((string) ($data['date'] ?? ''));
+        $time       = sanitize_text_field((string) ($data['time'] ?? ''));
 
+        if ($service_id <= 0 || self::SERVICE_TYPE !== get_post_type($service_id) || 'publish' !== get_post_status($service_id)) {
+            return new \WP_REST_Response(['error' => __('A valid service is required.', 'gratis-booking')], 400);
+        }
         if ('' === $email || !is_email($email)) {
             return new \WP_REST_Response(['error' => __('A valid email is required.', 'gratis-booking')], 400);
         }
+        if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)) {
+            return new \WP_REST_Response(['error' => __('A valid booking date (YYYY-MM-DD) is required.', 'gratis-booking')], 400);
+        }
+        [$year, $month, $day] = array_map('intval', explode('-', $date));
+        if (!checkdate($month, $day, $year) || $date < gmdate('Y-m-d')) {
+            return new \WP_REST_Response(['error' => __('Booking date must be today or in the future.', 'gratis-booking')], 400);
+        }
+        if (!preg_match('/^\d{2}:\d{2}$/', $time)) {
+            return new \WP_REST_Response(['error' => __('A valid booking time (HH:MM) is required.', 'gratis-booking')], 400);
+        }
+
+        $duration  = (int) get_post_meta($service_id, '_duration', true) ?: Settings::slotInterval();
+        $available = self::getAvailableSlots($service_id, $date, $duration);
+        if (!in_array($time, $available, true)) {
+            return new \WP_REST_Response(['error' => __('Selected time slot is no longer available.', 'gratis-booking')], 409);
+        }
+
+        set_transient($rate_key, $attempts + 1, HOUR_IN_SECONDS);
+
+        $sanitized = [
+            'service_id' => $service_id,
+            'name'       => '' !== $name ? $name : 'Guest',
+            'email'      => $email,
+            'date'       => $date,
+            'time'       => $time,
+        ];
 
         $id = wp_insert_post([
             'post_type'   => self::APPOINTMENT_TYPE,
             'post_status' => 'publish',
-            'post_title'  => $name . ' - ' . $date . ' ' . $time,
+            'post_title'  => $sanitized['name'] . ' - ' . $date . ' ' . $time,
             'meta_input'  => [
-                '_service_id' => (int) ($data['service_id'] ?? 0),
+                '_service_id' => $service_id,
                 '_date'       => $date,
                 '_time'       => $time,
-                '_name'       => $name,
+                '_name'       => $sanitized['name'],
                 '_email'      => $email,
                 '_status'     => 'confirmed',
             ],
@@ -105,10 +141,19 @@ final class BookingSystem {
             return new \WP_REST_Response(['error' => $id->get_error_message()], 500);
         }
 
-        self::notify($email, $name, $date, $time);
-        do_action('gratis_booking_created', $id, $data);
+        self::notify($email, $sanitized['name'], $date, $time);
+        do_action('gratis_booking_created', $id, $sanitized);
 
         return new \WP_REST_Response(['success' => true, 'id' => $id]);
+    }
+
+    /** Daily-rotating salted hash of the visitor IP for rate limiting without storing raw IPs. */
+    private static function visitorHash(): string {
+        $ip = isset($_SERVER['REMOTE_ADDR'])
+            ? sanitize_text_field(wp_unslash($_SERVER['REMOTE_ADDR']))
+            : '';
+        $ip = (string) filter_var($ip, FILTER_VALIDATE_IP);
+        return substr(hash('sha256', wp_salt('nonce') . '|' . gmdate('Y-m-d') . '|' . $ip), 0, 16);
     }
 
     /** Send confirmation emails to the customer and the site admin. */
@@ -217,7 +262,7 @@ final class BookingSystem {
      * @return string[]
      */
     private static function getAvailableSlots(int $serviceId, string $date, int $duration): array {
-        $duration = $duration > 0 ? $duration : 60;
+        $duration = max(5, $duration > 0 ? $duration : 60);
 
         // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query -- bounded admin/booking lookup.
         $booked = get_posts([
@@ -238,14 +283,14 @@ final class BookingSystem {
         );
 
         [$startHour, $endHour] = Settings::businessHours();
+        $startMinutes          = $startHour * 60;
+        $endMinutes            = $endHour * 60;
 
         $slots = [];
-        for ($h = $startHour; $h < $endHour; $h++) {
-            for ($m = 0; $m < 60; $m += $duration) {
-                $time = sprintf('%02d:%02d', $h, $m);
-                if (!in_array($time, $bookedTimes, true)) {
-                    $slots[] = $time;
-                }
+        for ($minutes = $startMinutes; $minutes + $duration <= $endMinutes; $minutes += $duration) {
+            $time = sprintf('%02d:%02d', intdiv($minutes, 60), $minutes % 60);
+            if (!in_array($time, $bookedTimes, true)) {
+                $slots[] = $time;
             }
         }
 
