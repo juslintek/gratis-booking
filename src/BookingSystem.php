@@ -224,6 +224,7 @@ final class BookingSystem {
             'post_type'      => self::APPOINTMENT_TYPE,
             // phpcs:ignore WordPress.WP.PostsPerPage.posts_per_page_posts_per_page -- bounded booking lookup.
             'posts_per_page' => 200,
+            // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query -- bounded slot lookup for one service and date.
             'meta_query'     => [
                 'relation' => 'AND',
                 ['key' => '_service_id', 'value' => $serviceId],
